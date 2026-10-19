@@ -1,0 +1,35 @@
+@StockManagement.Api_HostAddress = http://localhost:5135
+@categoryId = 00000000-0000-0000-0000-000000000000
+
+### Create a category first, then replace @categoryId above with the returned id.
+POST {{StockManagement.Api_HostAddress}}/api/categories
+Content-Type: application/json
+
+{
+  "name": "Electronics",
+  "description": "Electronic goods"
+}
+
+### List categories
+GET {{StockManagement.Api_HostAddress}}/api/categories
+Accept: application/json
+
+###
+### Create product with an existing CategoryId
+POST {{StockManagement.Api_HostAddress}}/api/products
+Content-Type: application/json
+
+{
+  "name": "Keyboard",
+  "sku": "KB-001",
+  "barcode": "123456",
+  "description": "USB keyboard",
+  "categoryId": "{{categoryId}}",
+  "unitPrice": 45.90,
+  "unitOfMeasure": "Piece",
+  "isActive": true
+}
+
+### List products
+GET {{StockManagement.Api_HostAddress}}/api/products
+Accept: application/json
