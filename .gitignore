@@ -2,3 +2,34 @@
 **/obj/
 .vs/
 .dotnet-home/
+
+
+# .NET Build və Arxiv Qovluqlari
+[Bb]in/
+[Oo]bj/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# Visual Studio qovluqları
+.vs/
+.vscode/
+
+# Log faylları
+*.log
+.*.log
+logs/
+
+# Həssas konfiqurasiya faylları (Şifrələr və API açarları)
+appsettings.Development.json
+appsettings.Production.json
+secrets.json
+.env
+
+# Frontend (Node.js) qovluqları
+node_modules/
+dist/
+build/
+.npm
+.cache
