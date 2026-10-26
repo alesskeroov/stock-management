@@ -1,0 +1,20 @@
+{
+  "expo": {
+    "jsEngine": "hermes",
+    "name": "Stockroom",
+    "slug": "stockroom-mobile",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "light",
+    "newArchEnabled": true,
+    "plugins": [
+      "expo-secure-store"
+    ],
+    "android": {
+      "package": "az.stockroom.mobile"
+    },
+    "ios": {
+      "bundleIdentifier": "az.stockroom.mobile"
+    }
+  }
+}

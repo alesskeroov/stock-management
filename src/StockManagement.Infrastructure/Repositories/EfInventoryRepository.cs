@@ -4,10 +4,11 @@ using StockManagement.Application.Products.Repositories;
 using StockManagement.Domain.Entities;
 using StockManagement.Domain.Enums;
 using StockManagement.Infrastructure.Persistence;
+using StockManagement.Infrastructure.Services;
 
 namespace StockManagement.Infrastructure.Repositories;
 
-public sealed class EfInventoryRepository(StockManagementDbContext db) : IInventoryRepository
+public sealed class EfInventoryRepository(StockManagementDbContext db, StockLogService stockLogs) : IInventoryRepository
 {
     public async Task<IReadOnlyList<BatchInventoryItem>> GetActiveBatchesAsync(Guid productId, CancellationToken cancellationToken = default) =>
         await db.ProductBatches.AsNoTracking().Where(x => x.ProductId == productId && x.RemainingQuantity > 0)
@@ -45,10 +46,15 @@ public sealed class EfInventoryRepository(StockManagementDbContext db) : IInvent
         var batch = new ProductBatch(productId, warehouseId, $"LOT-{Guid.NewGuid():N}"[..20], quantity,
             occurredAt, expiryDate, purchasePrice, salePrice);
         await using var tx = await db.Database.BeginTransactionAsync(cancellationToken);
+        var productName = await db.Products.Where(x => x.Id == productId).Select(x => x.Name).SingleAsync(cancellationToken);
+        var totalBefore = await db.Stocks.Where(x => x.ProductId == productId)
+            .SumAsync(x => (decimal?)x.Quantity, cancellationToken) ?? 0m;
         db.ProductBatches.Add(batch);
         var stock = await db.Stocks.SingleOrDefaultAsync(x => x.ProductId == productId && x.WarehouseId == warehouseId, cancellationToken);
         if (stock is null) { stock = new Stock(productId, warehouseId, quantity); db.Stocks.Add(stock); }
         else stock.SetQuantity(stock.Quantity + quantity);
+        stockLogs.Record(productId, productName, StockLogType.IN, totalBefore, totalBefore + quantity,
+            $"Anbara giriş: {batch.BatchNumber}", appUserId);
         db.StockTransactions.Add(new StockTransaction(productId, warehouseId, StockTransactionType.Purchase,
             quantity, batch.BatchNumber, purchasePrice, $"Anbara giriş: {batch.BatchNumber}", appUserId));
         await db.SaveChangesAsync(cancellationToken);
@@ -63,6 +69,8 @@ public sealed class EfInventoryRepository(StockManagementDbContext db) : IInvent
         // Serializable range locks serialize issues and receipts for the same indexed product/warehouse range.
         await using var tx = await db.Database.BeginTransactionAsync(System.Data.IsolationLevel.Serializable, cancellationToken);
         var stock = await db.Stocks.SingleOrDefaultAsync(x => x.ProductId == productId && x.WarehouseId == warehouseId, cancellationToken);
+        var totalBefore = await db.Stocks.Where(x => x.ProductId == productId)
+            .SumAsync(x => (decimal?)x.Quantity, cancellationToken) ?? 0m;
         var batches = await db.ProductBatches.Where(x => x.ProductId == productId && x.WarehouseId == warehouseId && x.RemainingQuantity > 0)
             .OrderBy(x => x.EntryDate).ThenBy(x => x.Id).ToListAsync(cancellationToken);
         var available = batches.Sum(x => x.RemainingQuantity);
@@ -83,6 +91,8 @@ public sealed class EfInventoryRepository(StockManagementDbContext db) : IInvent
         }
         stock.SetQuantity(stock.Quantity - quantity);
         var product = await db.Products.SingleAsync(x => x.Id == productId, cancellationToken);
+        stockLogs.Record(productId, product.Name, StockLogType.OUT, totalBefore,
+            totalBefore - quantity, $"FIFO üzrə çıxış: {referenceNo}", appUserId);
         db.StockTransactions.Add(new StockTransaction(productId, warehouseId, StockTransactionType.Sale,
             -quantity, referenceNo, allocations[0].PurchasePrice, "FIFO üzrə satış", appUserId));
         await db.SaveChangesAsync(cancellationToken);

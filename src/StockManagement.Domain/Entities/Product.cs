@@ -19,6 +19,9 @@ public sealed class Product : ISoftDeletable
     public string Description { get; private set; } = string.Empty;
     public Guid CategoryId { get; private set; }
     public decimal UnitPrice { get; private set; }
+    public decimal Stock { get; private set; }
+    public decimal AverageCost { get; private set; }
+    public decimal ReorderLevel { get; private set; } = 10m;
     public string UnitOfMeasure { get; private set; } = "Piece";
     public bool IsActive { get; private set; } = true;
     public DateTime EntryDate { get; private set; } = DateTime.UtcNow;
@@ -31,6 +34,18 @@ public sealed class Product : ISoftDeletable
         if (IsDeleted) return;
         IsDeleted = true;
         DeletedAt = deletedAt ?? DateTime.UtcNow;
+    }
+
+    public void SetAverageCost(decimal averageCost)
+    {
+        if (averageCost < 0) throw new ArgumentOutOfRangeException(nameof(averageCost));
+        AverageCost = decimal.Round(averageCost, 2, MidpointRounding.AwayFromZero);
+    }
+
+    public void SetReorderLevel(decimal reorderLevel)
+    {
+        if (reorderLevel < 0) throw new ArgumentOutOfRangeException(nameof(reorderLevel));
+        ReorderLevel = reorderLevel;
     }
 
     public void Update(string name, string sku, string barcode, string description,

@@ -33,3 +33,7 @@ dist/
 build/
 .npm
 .cache
+
+# Local Expo state and generated build-check output
+mobile/.expo/
+src/StockManagement.Api/build-check/

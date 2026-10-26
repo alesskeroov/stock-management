@@ -41,6 +41,8 @@ internal static class ProductRules
         validator.RuleFor(x => x.CategoryId).NotEmpty().WithMessage("Kateqoriya seçilməlidir.");
         validator.RuleFor(x => x.UnitPrice).GreaterThanOrEqualTo(0)
             .WithMessage("Satış qiyməti mənfi ola bilməz.");
+        validator.RuleFor(x => x.ReorderLevel).GreaterThanOrEqualTo(0)
+            .WithMessage("Yenidən sifariş həddi mənfi ola bilməz.");
         validator.RuleFor(x => x.UnitOfMeasure).Cascade(CascadeMode.Stop)
             .Must(value => !string.IsNullOrWhiteSpace(value)).WithMessage("Ölçü vahidi tələb olunur.")
             .MaximumLength(32).WithMessage("Ölçü vahidi 32 simvoldan çox ola bilməz.");
@@ -55,5 +57,6 @@ public interface IProductRequest
     string Description { get; }
     Guid CategoryId { get; }
     decimal UnitPrice { get; }
+    decimal ReorderLevel { get; }
     string UnitOfMeasure { get; }
 }

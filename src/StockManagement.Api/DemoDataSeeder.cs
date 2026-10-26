@@ -1,6 +1,8 @@
 using Microsoft.EntityFrameworkCore;
 using StockManagement.Domain.Entities;
+using StockManagement.Domain.Enums;
 using StockManagement.Infrastructure.Persistence;
+using StockManagement.Infrastructure.Services;
 
 namespace StockManagement.Api;
 
@@ -10,6 +12,7 @@ public static class DemoDataSeeder
     {
         await using var scope = services.CreateAsyncScope();
         var db = scope.ServiceProvider.GetRequiredService<StockManagementDbContext>();
+        var stockLogs = scope.ServiceProvider.GetRequiredService<StockLogService>();
 
         var categoryNames = await db.Categories.Select(x => x.Name).ToListAsync();
         var missingCategories = new List<Category>();
@@ -60,9 +63,41 @@ public static class DemoDataSeeder
                 product.Id,
                 warehouse.Id,
                 index % 4 == 0 ? random.Next(0, 5) : random.Next(5, 41),
-                criticalLowLevel: 5));
+                criticalLowLevel: 5)).ToArray();
+            foreach (var stock in stocks)
+                stockLogs.Record(stock.ProductId, products.Single(x => x.Id == stock.ProductId).Name,
+                    StockLogType.IN, 0, stock.Quantity, "Demo başlanğıc stoku", null);
             db.Stocks.AddRange(stocks);
             await db.SaveChangesAsync();
+        }
+
+        const string demoPartnerPrefix = "Demo tərəfdaş — ";
+        if (!await db.Documents.AnyAsync(x => x.Partner != null && x.Partner.StartsWith(demoPartnerPrefix)))
+        {
+            var products = await db.Products.Where(x => x.IsActive).OrderBy(x => x.Sku).Take(4).ToArrayAsync();
+            if (products.Length > 0)
+            {
+                var numbers = scope.ServiceProvider.GetRequiredService<DocumentNumberService>();
+                var today = DateOnly.FromDateTime(DateTime.Today);
+                var examples = new (string Type, int DaysAgo, string Partner, int ProductIndex, decimal Qty)[]
+                {
+                    ("in", 12, $"{demoPartnerPrefix}Bakı təchizat", 0, 24m),
+                    ("out", 8, $"{demoPartnerPrefix}Mərkəzi mağaza", Math.Min(1, products.Length - 1), 6m),
+                    ("in", 3, $"{demoPartnerPrefix}Elektronika", Math.Min(2, products.Length - 1), 12m),
+                    ("out", 1, $"{demoPartnerPrefix}Filial 02", Math.Min(3, products.Length - 1), 3m),
+                };
+
+                foreach (var example in examples)
+                {
+                    var product = products[example.ProductIndex];
+                    var number = await numbers.GetNextStockDocumentNumberAsync(example.Type);
+                    var document = new Document(number, example.Type, today.AddDays(-example.DaysAgo), example.Partner);
+                    document.Items.Add(new DocumentItem(document.Id, product.Id, example.Qty, product.UnitPrice));
+                    db.Documents.Add(document);
+                }
+
+                await db.SaveChangesAsync();
+            }
         }
     }
 

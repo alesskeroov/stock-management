@@ -3,6 +3,7 @@ using StockManagement.Application;
 using StockManagement.Application.Security;
 using StockManagement.Infrastructure.Authentication;
 using StockManagement.Infrastructure;
+using StockManagement.Infrastructure.Services;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.IdentityModel.Tokens;
@@ -103,6 +104,66 @@ builder.Services.AddInfrastructure(builder.Configuration);
 
 var app = builder.Build();
 
+var maintenanceFlag = Array.IndexOf(args, "--maintenance");
+if (maintenanceFlag >= 0)
+{
+    var command = maintenanceFlag + 1 < args.Length ? args[maintenanceFlag + 1] : string.Empty;
+    await using var scope = app.Services.CreateAsyncScope();
+    if (command.Equals("opening-balance", StringComparison.OrdinalIgnoreCase))
+    {
+        var userFlag = Array.IndexOf(args, "--created-by");
+        if (userFlag < 0 || userFlag + 1 >= args.Length || !Guid.TryParse(args[userFlag + 1], out var createdBy))
+        {
+            Console.Error.WriteLine("opening-balance üçün --created-by <mövcud istifadəçi GUID-i> tələb olunur.");
+            return 2;
+        }
+        var count = await scope.ServiceProvider.GetRequiredService<OpeningBalanceCommand>().ExecuteAsync(createdBy);
+        Console.WriteLine(count == 0
+            ? "Açılış qalığı artıq var; heç bir hərəkət əlavə edilmədi."
+            : $"{count} OPENING_BALANCE hərəkəti yaradıldı.");
+        return 0;
+    }
+
+    if (command.Equals("reconcile", StringComparison.OrdinalIgnoreCase))
+    {
+        var differences = await scope.ServiceProvider.GetRequiredService<StockReconciliationCommand>().ExecuteAsync();
+        if (differences.Count == 0) Console.WriteLine("Cache və ledger uyğun gəlir.");
+        else
+        {
+            foreach (var difference in differences)
+                Console.WriteLine($"product={difference.ProductId} warehouse={difference.WarehouseId} cache={difference.CachedQuantity} ledger={difference.MovementQuantity}");
+            Console.WriteLine($"{differences.Count} fərq tapıldı; heç bir məlumat dəyişdirilmədi.");
+        }
+        return differences.Count == 0 ? 0 : 1;
+    }
+
+    if (command.Equals("procurement-demo", StringComparison.OrdinalIgnoreCase))
+    {
+        var count = 20;
+        var countFlag = Array.IndexOf(args, "--count");
+        if (countFlag >= 0 && (countFlag + 1 >= args.Length || !int.TryParse(args[countFlag + 1], out count) || count is < 1 or > 50))
+        {
+            Console.Error.WriteLine("procurement-demo üçün --count 1-50 aralığında olmalıdır (defolt: 20).");
+            return 2;
+        }
+
+        await DemoDataSeeder.SeedAsync(app.Services);
+        await AuthSeeder.SeedAsync(app.Services, app.Configuration);
+        var services = scope.ServiceProvider;
+        var seeded = await new ProcurementDemoDataCommand(
+            services.GetRequiredService<StockManagement.Infrastructure.Persistence.StockManagementDbContext>(),
+            services.GetRequiredService<PurchaseOrderService>(),
+            services.GetRequiredService<GoodsReceiptService>(),
+            services.GetRequiredService<OpeningBalanceCommand>()).ExecuteAsync(count);
+        Console.WriteLine($"Demo seed tamamlandı. Yeni təchizatçı: {seeded.Suppliers}; yeni PO: {seeded.PurchaseOrders}; yeni GRN: {seeded.GoodsReceipts}.");
+        Console.WriteLine("Əmr təkrar işlədikdə mövcud demo PO-lar təkrarlanmır.");
+        return 0;
+    }
+
+    Console.Error.WriteLine("Əmr: --maintenance opening-balance --created-by <user-guid> | --maintenance reconcile | --maintenance procurement-demo [--count 20]");
+    return 2;
+}
+
 await DemoDataSeeder.SeedAsync(app.Services);
 await AuthSeeder.SeedAsync(app.Services, app.Configuration);
 
@@ -122,3 +183,4 @@ app.MapControllers();
 app.MapGet("/", () => Results.Redirect("/swagger")).AllowAnonymous();
 
 app.Run();
+return 0;

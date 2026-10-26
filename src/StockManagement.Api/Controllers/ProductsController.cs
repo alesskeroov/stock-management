@@ -18,8 +18,14 @@ public sealed class ProductsController(
 {
     [HttpGet]
     [Authorize(Policy = Permissions.ProductsRead)]
-    public async Task<ActionResult<IReadOnlyCollection<ProductDto>>> GetAll(CancellationToken cancellationToken) =>
-        Ok(await service.GetAllAsync(cancellationToken));
+    public async Task<ActionResult<ProductPage>> GetAll([FromQuery] string? page, [FromQuery] string? size,
+        CancellationToken cancellationToken)
+    {
+        var parsedPage = int.TryParse(page, out var pageValue) && pageValue > 0 ? pageValue : 1;
+        var parsedSize = int.TryParse(size, out var sizeValue) && sizeValue > 0
+            ? sizeValue : ProductService.DefaultPageSize;
+        return Ok(await service.GetPageAsync(parsedPage, parsedSize, cancellationToken));
+    }
 
     [HttpGet("{id:guid}")]
     [Authorize(Policy = Permissions.ProductsRead)]

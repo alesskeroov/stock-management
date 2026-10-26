@@ -34,4 +34,11 @@ public sealed class Stock
         Quantity = quantity;
         LastUpdatedDate = DateTime.UtcNow;
     }
+
+    public void Increase(decimal quantity)
+    {
+        if (quantity <= 0) throw new ArgumentOutOfRangeException(nameof(quantity));
+        Quantity += quantity;
+        LastUpdatedDate = DateTime.UtcNow;
+    }
 }

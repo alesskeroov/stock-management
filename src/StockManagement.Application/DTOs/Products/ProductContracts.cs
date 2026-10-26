@@ -4,13 +4,15 @@ using System.Text.Json.Serialization;
 namespace StockManagement.Application.DTOs.Products;
 
 public sealed record ProductDto(Guid Id, string Name, string Sku, string Barcode, string Description,
-    Guid CategoryId, decimal UnitPrice, string UnitOfMeasure, bool IsActive, decimal Quantity,
+    Guid CategoryId, decimal UnitPrice, string UnitOfMeasure, bool IsActive, decimal Quantity, decimal ReorderLevel,
     [property: JsonPropertyName("createdAt")] DateTime CreatedAt,
     [property: JsonPropertyName("updatedAt")] DateTime UpdatedAt);
+public sealed record ProductPage(IReadOnlyCollection<ProductDto> Items, int CurrentPage, int PageSize,
+    int TotalCount, int TotalPages, bool HasNext, bool HasPrevious);
 public sealed record CreateProductRequest(string Name, string Sku, string Barcode, string Description,
-    Guid CategoryId, decimal UnitPrice, string UnitOfMeasure, bool IsActive = true) : IProductRequest;
+    Guid CategoryId, decimal UnitPrice, string UnitOfMeasure, bool IsActive = true, decimal ReorderLevel = 10) : IProductRequest;
 public sealed record UpdateProductRequest(string Name, string Sku, string Barcode, string Description,
-    Guid CategoryId, decimal UnitPrice, string UnitOfMeasure, bool IsActive) : IProductRequest;
+    Guid CategoryId, decimal UnitPrice, string UnitOfMeasure, bool IsActive, decimal ReorderLevel = 10) : IProductRequest;
 public sealed record UpdateProductStockRequest(decimal Quantity);
 
 public static class ProductMapping
@@ -18,7 +20,7 @@ public static class ProductMapping
     public static ProductDto ToDto(this Product product, decimal quantity = 0,
         DateTime? createdAt = null, DateTime? updatedAt = null) =>
         new(product.Id, product.Name, product.Sku, product.Barcode, product.Description,
-            product.CategoryId, product.UnitPrice, product.UnitOfMeasure, product.IsActive, quantity,
+            product.CategoryId, product.UnitPrice, product.UnitOfMeasure, product.IsActive, quantity, product.ReorderLevel,
             AsUtc(createdAt ?? product.EntryDate), AsUtc(updatedAt ?? product.EntryDate));
 
     private static DateTime AsUtc(DateTime value) => value.Kind switch

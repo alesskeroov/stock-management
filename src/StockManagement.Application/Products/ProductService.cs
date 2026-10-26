@@ -1,4 +1,5 @@
 using StockManagement.Application.Abstractions.Repositories;
+using StockManagement.Application.Abstractions;
 using StockManagement.Application.DTOs.Products;
 using StockManagement.Application.Products.Repositories;
 using StockManagement.Domain.Entities;
@@ -7,27 +8,39 @@ namespace StockManagement.Application.Products;
 
 public sealed class ProductService(
     IProductRepository repository,
-    IGenericRepository<Category> categoryRepository)
+    IGenericRepository<Category> categoryRepository,
+    IStockNotificationService stockNotifications)
 {
-    public async Task<IReadOnlyCollection<ProductDto>> GetAllAsync(CancellationToken cancellationToken = default)
+    public const int DefaultPageSize = 10;
+    public const int MaximumPageSize = 10;
+    public static int NormalizePage(int page) => page < 1 ? 1 : page;
+    public static int NormalizePageSize(int size) => size < 1 ? DefaultPageSize : Math.Min(size, MaximumPageSize);
+
+    public async Task<ProductPage> GetPageAsync(int page, int size, CancellationToken cancellationToken = default)
     {
-        var products = await repository.GetAllAsync(cancellationToken);
-        var quantities = await repository.GetStockQuantitiesAsync(cancellationToken);
-        var dates = await repository.GetProductActivityDatesAsync(cancellationToken);
-        return products.OrderBy(x => x.Name)
+        size = NormalizePageSize(size);
+        page = NormalizePage(page);
+        var (products, totalCount) = await repository.GetPageAsync(page, size, cancellationToken);
+        var totalPages = (int)Math.Ceiling(totalCount / (double)size);
+        page = totalPages == 0 ? 1 : Math.Min(page, totalPages);
+        var productIds = products.Select(x => x.Id).ToArray();
+        var quantities = await repository.GetStockQuantitiesAsync(productIds, cancellationToken);
+        var dates = await repository.GetProductActivityDatesAsync(productIds, cancellationToken);
+        var items = products
             .Select(product =>
             {
                 var activity = dates.GetValueOrDefault(product.Id);
                 return product.ToDto(quantities.GetValueOrDefault(product.Id), activity.CreatedAt, activity.UpdatedAt);
             })
             .ToArray();
+        return new(items, page, size, totalCount, totalPages, page < totalPages, page > 1);
     }
 
     public async Task<ProductDto?> GetByIdAsync(Guid id, CancellationToken cancellationToken = default)
     {
         var product = await repository.GetByIdAsync(id, cancellationToken);
         if (product is null) return null;
-        var activity = (await repository.GetProductActivityDatesAsync(cancellationToken)).GetValueOrDefault(id);
+        var activity = (await repository.GetProductActivityDatesAsync([id], cancellationToken)).GetValueOrDefault(id);
         return product.ToDto(await repository.GetStockQuantityAsync(id, cancellationToken), activity.CreatedAt, activity.UpdatedAt);
     }
 
@@ -35,6 +48,7 @@ public sealed class ProductService(
         CancellationToken cancellationToken = default)
     {
         if (!await repository.SetStockQuantityAsync(id, quantity, appUserId, cancellationToken)) return null;
+        await stockNotifications.RefreshForProductAsync(id, cancellationToken);
         return await GetByIdAsync(id, cancellationToken);
     }
 
@@ -45,7 +59,9 @@ public sealed class ProductService(
         await EnsureBarcodeAvailableAsync(request.Barcode, cancellationToken: cancellationToken);
         var product = new Product(request.Name, request.Sku, request.Barcode, request.Description,
             request.CategoryId, request.UnitPrice, request.UnitOfMeasure, request.IsActive);
+        product.SetReorderLevel(request.ReorderLevel);
         await repository.AddAsync(product, cancellationToken);
+        await stockNotifications.RefreshForProductAsync(product.Id, cancellationToken);
         return product.ToDto();
     }
 
@@ -59,7 +75,9 @@ public sealed class ProductService(
         await EnsureBarcodeAvailableAsync(request.Barcode, id, cancellationToken);
         product.Update(request.Name, request.Sku, request.Barcode, request.Description,
             request.CategoryId, request.UnitPrice, request.UnitOfMeasure, request.IsActive);
+        product.SetReorderLevel(request.ReorderLevel);
         await repository.UpdateAsync(product, cancellationToken);
+        await stockNotifications.RefreshForProductAsync(product.Id, cancellationToken);
         return product.ToDto();
     }
 

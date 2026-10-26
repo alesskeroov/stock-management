@@ -3,7 +3,8 @@ using StockManagement.Application.Abstractions;
 
 namespace StockManagement.Application.Products;
 
-public sealed class InventoryService(IInventoryRepository repository, IQrCodeGenerator qrCodeGenerator)
+public sealed class InventoryService(IInventoryRepository repository, IQrCodeGenerator qrCodeGenerator,
+    IStockNotificationService stockNotifications)
 {
     public Task<IReadOnlyList<BatchInventoryItem>> GetActiveBatchesAsync(Guid productId, CancellationToken cancellationToken = default) =>
         repository.GetActiveBatchesAsync(productId, cancellationToken);
@@ -27,6 +28,7 @@ public sealed class InventoryService(IInventoryRepository repository, IQrCodeGen
             throw new ArgumentException("Son istifadə tarixi giriş tarixindən əvvəl ola bilməz.", nameof(request.ExpiryDate));
         var batch = await repository.ReceiveAsync(request.ProductId, request.WarehouseId, request.Quantity,
             request.PurchasePrice, request.SalePrice, request.EntryDate, request.ExpiryDate, appUserId, cancellationToken);
+        await stockNotifications.RefreshForProductAsync(request.ProductId, cancellationToken);
         return new StockReceiptResult(batch.BatchNumber, batch.InitialQuantity, batch.EntryDate,
             qrCodeGenerator.ToSvg(batch.BatchNumber));
     }
@@ -36,7 +38,9 @@ public sealed class InventoryService(IInventoryRepository repository, IQrCodeGen
     {
         if (quantity <= 0) throw new ArgumentOutOfRangeException(nameof(quantity), "Miqdar sıfırdan böyük olmalıdır.");
         if (string.IsNullOrWhiteSpace(referenceNo)) throw new ArgumentException("Əməliyyat nömrəsi tələb olunur.", nameof(referenceNo));
-        return new StockIssueResult(await repository.IssueFifoAsync(productId, warehouseId, quantity,
-            referenceNo, appUserId, cancellationToken));
+        var allocations = await repository.IssueFifoAsync(productId, warehouseId, quantity,
+            referenceNo, appUserId, cancellationToken);
+        await stockNotifications.RefreshForProductAsync(productId, cancellationToken);
+        return new StockIssueResult(allocations);
     }
 }

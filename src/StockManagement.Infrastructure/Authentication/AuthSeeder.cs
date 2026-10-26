@@ -10,13 +10,6 @@ namespace StockManagement.Infrastructure.Authentication;
 
 public static class AuthSeeder
 {
-    private static readonly IReadOnlyDictionary<string, string[]> RolePermissions = new Dictionary<string, string[]>
-    {
-        [Roles.Admin] = Permissions.All,
-        [Roles.WarehouseKeeper] = [Permissions.ProductsRead, Permissions.StockIn, Permissions.StockOut],
-        [Roles.Manager] = [Permissions.ProductsRead, Permissions.StockRead, Permissions.ReportsRead, Permissions.ApprovalsManage]
-    };
-
     public static async Task SeedAsync(IServiceProvider services, IConfiguration configuration)
     {
         await using var scope = services.CreateAsyncScope();
@@ -36,7 +29,8 @@ public static class AuthSeeder
             }
 
             var existingClaims = await roleManager.GetClaimsAsync(role);
-            var allowedPermissions = RolePermissions[roleName].ToHashSet(StringComparer.Ordinal);
+            var rolePermissions = RolePermissionDefaults.For(roleName);
+            var allowedPermissions = rolePermissions.ToHashSet(StringComparer.Ordinal);
             foreach (var obsoleteClaim in existingClaims.Where(x => x.Type == "permission" && !allowedPermissions.Contains(x.Value)))
             {
                 var removeResult = await roleManager.RemoveClaimAsync(role, obsoleteClaim);
@@ -44,7 +38,7 @@ public static class AuthSeeder
                     throw new InvalidOperationException($"'{roleName}' rolundan '{obsoleteClaim.Value}' icazəsi silinmədi: {string.Join("; ", removeResult.Errors.Select(x => x.Description))}");
             }
 
-            foreach (var permission in RolePermissions[roleName].Except(existingClaims
+            foreach (var permission in rolePermissions.Except(existingClaims
                          .Where(x => x.Type == "permission").Select(x => x.Value), StringComparer.Ordinal))
             {
                 var addClaim = await roleManager.AddClaimAsync(role, new Claim("permission", permission));

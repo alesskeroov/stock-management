@@ -16,8 +16,24 @@ public sealed class CategoriesController(
 {
     [HttpGet]
     [Authorize(Policy = Permissions.ProductsRead)]
-    public async Task<ActionResult<IReadOnlyCollection<CategoryDto>>> GetAll(CancellationToken cancellationToken) =>
+    public async Task<IActionResult> GetAll([FromQuery] string? page, [FromQuery] string? size,
+        [FromQuery] string? q, CancellationToken cancellationToken)
+    {
+        if (!TryPositiveInt(page, 1, out var currentPage) || !TryPositiveInt(size, CategoryService.DefaultPageSize, out var pageSize))
+            return BadRequest(new { error = "page və size müsbət tam ədəd olmalıdır." });
+        return Ok(await service.GetPageAsync(currentPage, pageSize, q, cancellationToken));
+    }
+
+    [HttpGet("options")]
+    [Authorize(Policy = Permissions.ProductsRead)]
+    public async Task<ActionResult<IReadOnlyCollection<CategoryDto>>> GetOptions(CancellationToken cancellationToken) =>
         Ok(await service.GetAllAsync(cancellationToken));
+
+    private static bool TryPositiveInt(string? value, int fallback, out int parsed)
+    {
+        if (string.IsNullOrWhiteSpace(value)) { parsed = fallback; return true; }
+        return int.TryParse(value, out parsed) && parsed > 0;
+    }
 
     [HttpGet("{id:guid}")]
     [Authorize(Policy = Permissions.ProductsRead)]

@@ -3,34 +3,61 @@ using StockManagement.Application.Products.Repositories;
 using StockManagement.Domain.Entities;
 using StockManagement.Domain.Enums;
 using StockManagement.Infrastructure.Persistence;
+using StockManagement.Infrastructure.Services;
 
 namespace StockManagement.Infrastructure.Repositories;
 
-public sealed class EfProductRepository(StockManagementDbContext dbContext)
+public sealed class EfProductRepository(StockManagementDbContext dbContext, StockLogService stockLogs)
     : EfRepository<Product>(dbContext), IProductRepository
 {
+    public EfProductRepository(StockManagementDbContext dbContext) : this(dbContext, new StockLogService(dbContext)) { }
+
+    public async Task<(IReadOnlyCollection<Product> Items, int TotalCount)> GetPageAsync(int page, int size,
+        CancellationToken cancellationToken = default)
+    {
+        var query = DbContext.Products.AsNoTracking();
+        var totalCount = await query.CountAsync(cancellationToken);
+        var totalPages = (int)Math.Ceiling(totalCount / (double)size);
+        page = totalPages == 0 ? 1 : Math.Clamp(page, 1, totalPages);
+        var items = await query.OrderBy(x => x.Name).ThenBy(x => x.Id)
+            .Skip((page - 1) * size).Take(size).ToArrayAsync(cancellationToken);
+        return (items, totalCount);
+    }
+
     public Task<Product?> GetBySkuAsync(string sku, CancellationToken cancellationToken = default) =>
         DbContext.Products.SingleOrDefaultAsync(x => x.Sku == sku.Trim(), cancellationToken);
 
     public Task<Product?> GetByBarcodeAsync(string barcode, CancellationToken cancellationToken = default) =>
         DbContext.Products.SingleOrDefaultAsync(x => x.Barcode == barcode.Trim() && x.Barcode != string.Empty, cancellationToken);
 
-    public async Task<IReadOnlyDictionary<Guid, decimal>> GetStockQuantitiesAsync(CancellationToken cancellationToken = default) =>
-        await DbContext.Stocks.AsNoTracking()
+    public async Task<IReadOnlyDictionary<Guid, decimal>> GetStockQuantitiesAsync(IReadOnlyCollection<Guid>? productIds = null,
+        CancellationToken cancellationToken = default)
+    {
+        var query = DbContext.Stocks.AsNoTracking();
+        if (productIds is not null) query = query.Where(x => productIds.Contains(x.ProductId));
+        return await query
             .Join(DbContext.Products.AsNoTracking(), stock => stock.ProductId, product => product.Id, (stock, product) => stock)
             .GroupBy(x => x.ProductId)
             .Select(group => new { ProductId = group.Key, Quantity = group.Sum(x => x.Quantity) })
             .ToDictionaryAsync(x => x.ProductId, x => x.Quantity, cancellationToken);
+    }
 
     public async Task<IReadOnlyDictionary<Guid, (DateTime? CreatedAt, DateTime? UpdatedAt)>> GetProductActivityDatesAsync(
-        CancellationToken cancellationToken = default)
+        IReadOnlyCollection<Guid>? productIds = null, CancellationToken cancellationToken = default)
     {
-        var createdDates = await DbContext.StockTransactions.AsNoTracking()
-            .Where(x => x.TransactionType == StockTransactionType.Purchase)
+        var createdQuery = DbContext.StockTransactions.AsNoTracking()
+            .Where(x => x.TransactionType == StockTransactionType.Purchase);
+        var updatedQuery = DbContext.Stocks.AsNoTracking();
+        if (productIds is not null)
+        {
+            createdQuery = createdQuery.Where(x => productIds.Contains(x.ProductId));
+            updatedQuery = updatedQuery.Where(x => productIds.Contains(x.ProductId));
+        }
+        var createdDates = await createdQuery
             .GroupBy(x => x.ProductId)
             .Select(group => new { ProductId = group.Key, CreatedAt = group.Max(x => x.CreatedAt) })
             .ToDictionaryAsync(x => x.ProductId, x => (DateTime?)x.CreatedAt, cancellationToken);
-        var updatedDates = await DbContext.Stocks.AsNoTracking()
+        var updatedDates = await updatedQuery
             .GroupBy(x => x.ProductId)
             .Select(group => new { ProductId = group.Key, UpdatedAt = group.Max(x => x.LastUpdatedDate) })
             .ToDictionaryAsync(x => x.ProductId, x => (DateTime?)x.UpdatedAt, cancellationToken);
@@ -93,6 +120,8 @@ public sealed class EfProductRepository(StockManagementDbContext dbContext)
             }
         }
 
+        stockLogs.Record(productId, product.Name, StockLogType.ADJUST, currentQuantity, quantity,
+            "Admin stok düzəlişi", appUserId);
         DbContext.StockTransactions.AddRange(transactions);
         await DbContext.SaveChangesAsync(cancellationToken);
         await transaction.CommitAsync(cancellationToken);

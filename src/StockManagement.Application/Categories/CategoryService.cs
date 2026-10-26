@@ -6,13 +6,27 @@ namespace StockManagement.Application.Categories;
 
 public sealed class CategoryService(
     IGenericRepository<Category> categories,
+    ICategoryRepository categoryPages,
     IGenericRepository<Product> products)
 {
+    public const int DefaultPageSize = 10;
+    public const int MaximumPageSize = 10;
+
     public async Task<IReadOnlyCollection<CategoryDto>> GetAllAsync(CancellationToken cancellationToken = default) =>
         (await categories.GetAllAsync(cancellationToken))
         .OrderBy(x => x.Name)
         .Select(x => x.ToDto())
         .ToArray();
+
+    public async Task<CategoryPage> GetPageAsync(int page, int size, string? search,
+        CancellationToken cancellationToken = default)
+    {
+        size = size < 1 ? DefaultPageSize : Math.Min(size, MaximumPageSize);
+        var (items, totalCount, currentPage) = await categoryPages.GetPageAsync(page, size, search, cancellationToken);
+        var totalPages = (int)Math.Ceiling(totalCount / (double)size);
+        return new(items.Select(x => x.ToDto()).ToArray(), currentPage, size, totalCount, totalPages,
+            currentPage < totalPages, currentPage > 1);
+    }
 
     public async Task<CategoryDto?> GetByIdAsync(Guid id, CancellationToken cancellationToken = default) =>
         (await categories.GetByIdAsync(id, cancellationToken))?.ToDto();
