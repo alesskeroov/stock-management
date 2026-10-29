@@ -1,4 +1,5 @@
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Data.SqlClient;
 using Microsoft.Extensions.Configuration;
 using Microsoft.AspNetCore.Authorization;
 using StockManagement.Api.Controllers;
@@ -56,9 +57,9 @@ public sealed class GoodsReceiptTests
         var retry = await service.CreateAsync(request, user.Id);
         Assert.Equal(first.Id, retry.Id);
         Assert.Equal(1, await db.GoodsReceipts.CountAsync());
-        Assert.Equal(1, await db.StockMovements.CountAsync());
-        Assert.Equal(5m, await db.StockMovements.SumAsync(x => x.Quantity));
-        Assert.Equal(StockMovementType.PurchaseIn, (await db.StockMovements.SingleAsync()).Type);
+        Assert.Equal(1, await db.StockMovements.CountAsync(x => x.Type == StockMovementType.PurchaseIn));
+        Assert.Equal(10m, await db.StockMovements.SumAsync(x => x.Quantity));
+        Assert.Equal(10m, (await db.Stocks.SingleAsync()).Quantity);
         var savedReceipt = await db.GoodsReceipts.SingleAsync();
         db.Entry(savedReceipt).State = EntityState.Modified;
         await Assert.ThrowsAsync<InvalidOperationException>(() => db.SaveChangesAsync());
@@ -105,7 +106,15 @@ public sealed class GoodsReceiptTests
         var tolerant = GrnService(db, 5);
         var receipt = await tolerant.CreateAsync(Request(orderId, poItemId, 105, 0, 2, "within-tolerance"), user.Id);
         Assert.Equal(105m, receipt.Items.Single().ReceivedQty);
-        Assert.Equal(105m, await db.StockMovements.SumAsync(x => x.Quantity));
+        Assert.Equal(105m, await db.StockMovements.Where(x => x.Type == StockMovementType.PurchaseIn).SumAsync(x => x.Quantity));
+        Assert.Equal(205m, await db.StockMovements.SumAsync(x => x.Quantity));
+        Assert.Equal(0m, Assert.Single((await PoService(db).GetAsync(orderId))!.Items).RemainingQty);
+        var toleranceConfig = new ConfigurationBuilder().AddInMemoryCollection(new Dictionary<string, string?>
+        {
+            ["Procurement:OverReceiptTolerancePercent"] = "5"
+        }).Build();
+        var poWithConfig = new PurchaseOrderService(db, new DocumentNumberService(db), new AuditLogService(db), toleranceConfig);
+        Assert.Equal(5m, (await poWithConfig.GetAsync(orderId))!.OverReceiptTolerancePercent);
     }
 
     [Fact]
@@ -117,8 +126,9 @@ public sealed class GoodsReceiptTests
         var receipt = await GrnService(db).CreateAsync(Request(orderId, poItemId, 0, 2, 3, "rejected-only"), user.Id);
         Assert.Equal(0m, receipt.Items.Single().ReceivedQty);
         Assert.Equal(2m, receipt.Items.Single().RejectedQty);
-        Assert.Empty(await db.StockMovements.ToArrayAsync());
-        Assert.Equal(0m, (await db.Stocks.SingleAsync(x => x.ProductId == product.Id)).Quantity);
+        Assert.Empty(await db.StockMovements.Where(x => x.Type == StockMovementType.PurchaseIn).ToArrayAsync());
+        Assert.Equal(5m, await db.StockMovements.SumAsync(x => x.Quantity));
+        Assert.Equal(5m, (await db.Stocks.SingleAsync(x => x.ProductId == product.Id)).Quantity);
         Assert.Equal(0m, (await db.PurchaseOrderItems.SingleAsync(x => x.Id == poItemId)).ReceivedQty);
         Assert.Equal(PurchaseOrderStatus.Approved, (await db.PurchaseOrders.SingleAsync(x => x.Id == orderId)).Status);
     }
@@ -142,9 +152,10 @@ public sealed class GoodsReceiptTests
             Request(approved.OrderId, approved.ItemId, 3, 0, 2, null), user.Id));
         db.ChangeTracker.Clear();
         Assert.Empty(await db.GoodsReceipts.ToArrayAsync());
-        Assert.Empty(await db.StockMovements.ToArrayAsync());
+        Assert.Empty(await db.StockMovements.Where(x => x.Type == StockMovementType.PurchaseIn).ToArrayAsync());
+        Assert.Equal(5m, await db.StockMovements.SumAsync(x => x.Quantity));
         Assert.Equal(0m, (await db.PurchaseOrderItems.SingleAsync(x => x.Id == approved.ItemId)).ReceivedQty);
-        Assert.Equal(0m, (await db.Stocks.SingleAsync(x => x.ProductId == product.Id)).Quantity);
+        Assert.Equal(5m, (await db.Stocks.SingleAsync(x => x.ProductId == product.Id)).Quantity);
         Assert.Equal(PurchaseOrderStatus.Approved, (await db.PurchaseOrders.SingleAsync(x => x.Id == approved.OrderId)).Status);
     }
 
@@ -179,6 +190,7 @@ public sealed class GoodsReceiptTests
         Assert.Equal(0m, (await db.PurchaseOrderItems.SingleAsync(x => x.Id == itemId)).ReceivedQty);
         Assert.Equal(PurchaseOrderStatus.Approved, (await db.PurchaseOrders.SingleAsync(x => x.Id == orderId)).Status);
         Assert.Equal(2, await db.StockMovements.CountAsync());
+        Assert.NotNull(Assert.Single((await PoService(db).GetAsync(orderId))!.GoodsReceipts).ReversedAt);
         Assert.Equal(-4m, await db.StockMovements.Where(x => x.Type == StockMovementType.Reversal).SumAsync(x => x.Quantity));
         await Assert.ThrowsAsync<GoodsReceiptConflictException>(() => service.ReverseAsync(receipt.Id, user.Id, "Təkrar", CancellationToken.None));
     }
@@ -271,6 +283,299 @@ public sealed class GoodsReceiptTests
         return new GoodsReceiptService(db, new StockService(new EfStockMovementRepository(db)),
             new DocumentNumberService(db), audit ?? new AuditLogService(db), configuration,
             new StockNotificationService(db));
+    }
+
+    [LocalSqlServerFact]
+    public async Task SqlServerReceiptPostingIsAtomicIdempotentAndSerializesParallelUsers()
+    {
+        // Only a newly named test database is created/deleted. The configured database is never used.
+        var databaseName = $"StockroomGrnTests_{Guid.NewGuid():N}";
+        var connection = new SqlConnectionStringBuilder(Environment.GetEnvironmentVariable("STOCKMANAGEMENT_TEST_SQL"))
+        {
+            InitialCatalog = databaseName,
+            Pooling = false
+        };
+        StockManagementDbContext Context() => new(new DbContextOptionsBuilder<StockManagementDbContext>()
+            .UseSqlServer(connection.ConnectionString).Options);
+        await using var db = Context();
+        try
+        {
+            await db.Database.MigrateAsync();
+            var (user, supplier, warehouse, product) = await SeedAsync(db, 0);
+            var otherUser = new ApplicationUser { UserName = "parallel-user", FirstName = "İkinci", LastName = "İstifadəçi" };
+            db.Users.Add(otherUser);
+            await db.SaveChangesAsync();
+            var order = await CreateApprovedOrder(db, user, supplier, warehouse, product, 100);
+            Assert.Equal(0m, (await db.Stocks.SingleAsync()).Quantity);
+            Assert.Empty(await db.StockMovements.ToArrayAsync());
+            var failedPo = new PurchaseOrderService(db, new DocumentNumberService(db), new FailingAuditLogService());
+            await Assert.ThrowsAsync<InvalidOperationException>(() => failedPo.CreateAsync(new SavePurchaseOrderRequest(
+                supplier.Id, warehouse.Id, new DateOnly(2026, 1, 1), null, "AZN", null,
+                [new PurchaseOrderLineRequest(product.Id, 1, 2)]), user.Id));
+            db.ChangeTracker.Clear();
+            Assert.Equal(1, await db.PurchaseOrders.CountAsync());
+            var firstRequest = Request(order.OrderId, order.ItemId, 60, 0, 2, "sql-first");
+            var first = await GrnService(db).CreateAsync(firstRequest, user.Id);
+            Assert.Equal(60m, (await db.Stocks.SingleAsync()).Quantity);
+            Assert.Equal("partially_received", (await PoService(db).GetAsync(order.OrderId))!.Status);
+            var second = await GrnService(db).CreateAsync(Request(order.OrderId, order.ItemId, 40, 0, 2, "sql-last"), user.Id);
+            Assert.Equal("received", (await PoService(db).GetAsync(order.OrderId))!.Status);
+            Assert.Equal(100m, (await db.Stocks.SingleAsync()).Quantity);
+            Assert.Equal(first.Id, (await GrnService(db).CreateAsync(firstRequest, user.Id)).Id);
+            await Assert.ThrowsAsync<GoodsReceiptConflictException>(() => GrnService(db).CreateAsync(
+                Request(order.OrderId, order.ItemId, 10, 0, 2, "sql-extra"), user.Id));
+            await GrnService(db).ReverseAsync(first.Id, user.Id, "Birinci qəbulu geri qaytar");
+            await Assert.ThrowsAsync<GoodsReceiptConflictException>(() => GrnService(db).ReverseAsync(first.Id, user.Id, "Təkrar"));
+            await GrnService(db).ReverseAsync(second.Id, user.Id, "İkinci qəbulu geri qaytar");
+            Assert.Equal(0m, (await db.Stocks.SingleAsync()).Quantity);
+
+            var parallelOrder = await CreateApprovedOrder(db, user, supplier, warehouse, product, 100);
+            var failing = new GoodsReceiptService(db, new StockService(new EfStockMovementRepository(db)),
+                new DocumentNumberService(db), new AuditLogService(db), new ConfigurationBuilder().Build(),
+                new FailingNotificationService());
+            await Assert.ThrowsAsync<InvalidOperationException>(() => failing.CreateAsync(
+                Request(parallelOrder.OrderId, parallelOrder.ItemId, 20, 0, 2, "sql-rollback"), user.Id));
+            db.ChangeTracker.Clear();
+            Assert.Equal(2, await db.GoodsReceipts.CountAsync());
+            Assert.Equal(0m, await db.StockMovements.SumAsync(x => x.Quantity));
+            Assert.Equal(0m, (await db.Stocks.SingleAsync()).Quantity);
+            Assert.Equal(0m, (await db.PurchaseOrderItems.SingleAsync(x => x.Id == parallelOrder.ItemId)).ReceivedQty);
+            Assert.Equal(PurchaseOrderStatus.Approved, (await db.PurchaseOrders.SingleAsync(x => x.Id == parallelOrder.OrderId)).Status);
+
+            var attempts = await Task.WhenAll(new[] { user.Id, otherUser.Id }.Select(async actor =>
+            {
+                await using var context = Context();
+                try
+                {
+                    await GrnService(context).CreateAsync(Request(parallelOrder.OrderId, parallelOrder.ItemId, 60, 0, 2, $"sql-parallel-{actor}"), actor);
+                    return true;
+                }
+                catch (GoodsReceiptValidationException) { return false; }
+            }));
+            Assert.Single(attempts, x => x);
+            db.ChangeTracker.Clear();
+            Assert.Equal(60m, (await db.Stocks.SingleAsync()).Quantity);
+            Assert.Equal(60m, (await db.PurchaseOrderItems.SingleAsync(x => x.Id == parallelOrder.ItemId)).ReceivedQty);
+
+            var retryRequest = Request(parallelOrder.OrderId, parallelOrder.ItemId, 40, 0, 2, "sql-parallel-retry");
+            var retries = await Task.WhenAll(new[] { user.Id, otherUser.Id }.Select(async actor =>
+            {
+                await using var context = Context();
+                return await GrnService(context).CreateAsync(retryRequest, actor);
+            }));
+            Assert.Equal(retries[0].Id, retries[1].Id);
+            db.ChangeTracker.Clear();
+            Assert.Equal(100m, (await db.Stocks.SingleAsync()).Quantity);
+            Assert.Equal(100m, await db.StockMovements.SumAsync(x => x.Quantity));
+            Assert.Equal(4, await db.GoodsReceipts.CountAsync());
+            var reversals = await Task.WhenAll(new[] { user.Id, otherUser.Id }.Select(async actor =>
+            {
+                await using var context = Context();
+                try { await GrnService(context).ReverseAsync(retries[0].Id, actor, "Paralel geri qaytarma"); return true; }
+                catch (GoodsReceiptConflictException) { return false; }
+            }));
+            Assert.Single(reversals, x => x);
+            db.ChangeTracker.Clear();
+            Assert.Equal(60m, (await db.Stocks.SingleAsync()).Quantity);
+            Assert.Equal(60m, (await db.PurchaseOrderItems.SingleAsync(x => x.Id == parallelOrder.ItemId)).ReceivedQty);
+            Assert.Equal(PurchaseOrderStatus.PartiallyReceived,
+                (await db.PurchaseOrders.SingleAsync(x => x.Id == parallelOrder.OrderId)).Status);
+
+            var separateOrderA = await CreateApprovedOrder(db, user, supplier, warehouse, product, 10);
+            var separateOrderB = await CreateApprovedOrder(db, otherUser, supplier, warehouse, product, 10);
+            var independentReceipts = await Task.WhenAll(new[]
+            {
+                (Order: separateOrderA, Actor: user.Id, Cost: 4m),
+                (Order: separateOrderB, Actor: otherUser.Id, Cost: 8m)
+            }.Select(async attempt =>
+            {
+                await using var context = Context();
+                return await GrnService(context).CreateAsync(Request(attempt.Order.OrderId, attempt.Order.ItemId,
+                    10, 0, attempt.Cost, $"sql-independent-{attempt.Order.OrderId}"), attempt.Actor);
+            }));
+            db.ChangeTracker.Clear();
+            Assert.Equal(80m, (await db.Stocks.SingleAsync()).Quantity);
+            Assert.Equal(3m, (await db.Products.SingleAsync()).AverageCost);
+            var reasons = independentReceipts.Select(x => $"Mal qəbulu: {x.GrnNumber}").ToArray();
+            var logBefore = await db.StockLogs.Where(x => reasons.Contains(x.Reason!)).OrderBy(x => x.QuantityBefore)
+                .Select(x => x.QuantityBefore).ToArrayAsync();
+            Assert.Equal(new[] { 60m, 70m }, logBefore);
+        }
+        finally
+        {
+            Assert.StartsWith("StockroomGrnTests_", databaseName);
+            Assert.Equal(databaseName, db.Database.GetDbConnection().Database);
+            await db.Database.EnsureDeletedAsync();
+        }
+    }
+
+    private sealed class LocalSqlServerFactAttribute : FactAttribute
+    {
+        public LocalSqlServerFactAttribute()
+        {
+            if (string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("STOCKMANAGEMENT_TEST_SQL")))
+                Skip = "SQL inteqrasiya testi üçün STOCKMANAGEMENT_TEST_SQL tələb olunur; yalnız yeni müvəqqəti test bazasına yazılır.";
+        }
+    }
+
+    private sealed class FailingNotificationService : IStockNotificationService
+    {
+        public Task RefreshForProductAsync(Guid productId, CancellationToken cancellationToken = default) =>
+            throw new InvalidOperationException("Injected failure after business data was saved inside the transaction.");
+        public Task<IReadOnlyCollection<StockManagement.Application.DTOs.Notifications.StockNotificationDto>> GetAllAsync(CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public Task<int> GetUnreadCountAsync(CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public Task<bool> MarkReadAsync(Guid id, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public Task MarkAllReadAsync(CancellationToken cancellationToken = default) => throw new NotSupportedException();
+    }
+
+    [Fact]
+    public async Task HundredUnitOrderReceivesSixtyThenFortyWithoutOverReceiptOrDuplicatePosting()
+    {
+        await using var db = NewContext();
+        var (user, supplier, warehouse, product) = await SeedAsync(db, 0);
+        var (orderId, itemId) = await CreateApprovedOrder(db, user, supplier, warehouse, product, 100);
+        Assert.Equal(0m, (await db.Stocks.SingleAsync()).Quantity);
+        Assert.Empty(await db.StockMovements.ToArrayAsync());
+
+        var service = GrnService(db);
+        var firstRequest = Request(orderId, itemId, 60, 0, 2, "hundred-first");
+        var first = await service.CreateAsync(firstRequest, user.Id);
+        Assert.Equal(60m, (await db.Stocks.SingleAsync()).Quantity);
+        Assert.Equal("partially_received", (await PoService(db).GetAsync(orderId))!.Status);
+        Assert.Equal(40m, Assert.Single((await PoService(db).GetAsync(orderId))!.Items).RemainingQty);
+        await service.CreateAsync(Request(orderId, itemId, 40, 0, 2, "hundred-last"), user.Id);
+        Assert.Equal("received", (await PoService(db).GetAsync(orderId))!.Status);
+        Assert.Equal(0m, Assert.Single((await PoService(db).GetAsync(orderId))!.Items).RemainingQty);
+        Assert.Equal(first.Id, (await service.CreateAsync(firstRequest, user.Id)).Id);
+        await Assert.ThrowsAsync<GoodsReceiptConflictException>(() => service.CreateAsync(
+            Request(orderId, itemId, 10, 0, 2, "hundred-extra"), user.Id));
+        db.ChangeTracker.Clear();
+        Assert.Equal(100m, (await db.Stocks.SingleAsync()).Quantity);
+        Assert.Equal(100m, await db.StockMovements.SumAsync(x => x.Quantity));
+        Assert.Equal(2, await db.GoodsReceipts.CountAsync());
+    }
+
+    [Fact]
+    public async Task SameIdempotencyKeyWithChangedQuantityOrOrderIsRejected()
+    {
+        await using var db = NewContext();
+        var (user, supplier, warehouse, product) = await SeedAsync(db, 0);
+        var firstOrder = await CreateApprovedOrder(db, user, supplier, warehouse, product, 10);
+        var secondOrder = await CreateApprovedOrder(db, user, supplier, warehouse, product, 10);
+        var service = GrnService(db);
+        await service.CreateAsync(Request(firstOrder.OrderId, firstOrder.ItemId, 4, 0, 2, "same-key"), user.Id);
+        await Assert.ThrowsAsync<GoodsReceiptConflictException>(() => service.CreateAsync(
+            Request(firstOrder.OrderId, firstOrder.ItemId, 5, 0, 2, "same-key"), user.Id));
+        await Assert.ThrowsAsync<GoodsReceiptConflictException>(() => service.CreateAsync(
+            Request(secondOrder.OrderId, secondOrder.ItemId, 4, 0, 2, "same-key"), user.Id));
+        Assert.Equal(4m, (await db.Stocks.SingleAsync()).Quantity);
+        Assert.Equal(1, await db.GoodsReceipts.CountAsync());
+        await Assert.ThrowsAsync<GoodsReceiptValidationException>(() => service.CreateAsync(
+            Request(firstOrder.OrderId, firstOrder.ItemId, 1, 0, 2, "body-key"), user.Id, "header-key"));
+    }
+
+    [Fact]
+    public async Task AverageCostUsesAllWarehousesAndReversalRestoresRemainingValue()
+    {
+        await using var db = NewContext();
+        var (user, supplier, warehouse, product) = await SeedAsync(db, 100);
+        var other = new Warehouse("İkinci anbar", "Gəncə");
+        db.AddRange(other, new Stock(product.Id, other.Id, 200),
+            new StockMovement(product.Id, other.Id, StockMovementType.OpeningBalance, 200, 5, "TEST", null, user.Id));
+        await db.SaveChangesAsync();
+        var order = await CreateApprovedOrder(db, user, supplier, warehouse, product, 100);
+        var service = GrnService(db);
+        var receipt = await service.CreateAsync(Request(order.OrderId, order.ItemId, 100, 0, 11, "global-cost"), user.Id);
+        Assert.Equal(6.5m, product.AverageCost);
+        await service.ReverseAsync(receipt.Id, user.Id, "Səhv qəbul");
+        db.ChangeTracker.Clear();
+        Assert.Equal(5m, (await db.Products.SingleAsync()).AverageCost);
+        Assert.Equal(300m, await db.Stocks.SumAsync(x => x.Quantity));
+    }
+
+    [Theory]
+    [InlineData("0.0001", "0", "2")]
+    [InlineData("1", "0.0001", "2")]
+    [InlineData("1", "0", "2.001")]
+    public async Task ValuesThatWouldBeRoundedBySqlAreRejected(string received, string rejected, string cost)
+    {
+        await using var db = NewContext();
+        var (user, supplier, warehouse, product) = await SeedAsync(db, 0);
+        var order = await CreateApprovedOrder(db, user, supplier, warehouse, product, 10);
+        var culture = System.Globalization.CultureInfo.InvariantCulture;
+        await Assert.ThrowsAsync<GoodsReceiptValidationException>(() => GrnService(db).CreateAsync(
+            Request(order.OrderId, order.ItemId, decimal.Parse(received, culture), decimal.Parse(rejected, culture),
+                decimal.Parse(cost, culture), "precision-test"), user.Id));
+        Assert.Empty(await db.GoodsReceipts.ToArrayAsync());
+        Assert.Equal(0m, (await db.Stocks.SingleAsync()).Quantity);
+    }
+
+    [Fact]
+    public async Task ReversingRejectedOnlyReceiptDoesNotReopenCompletedOrder()
+    {
+        await using var db = NewContext();
+        var (user, supplier, warehouse, product) = await SeedAsync(db, 0);
+        var order = await CreateApprovedOrder(db, user, supplier, warehouse, product, 100);
+        var service = GrnService(db);
+        var rejected = await service.CreateAsync(Request(order.OrderId, order.ItemId, 0, 2, 2, "rejected-before-full"), user.Id);
+        await service.CreateAsync(Request(order.OrderId, order.ItemId, 100, 0, 2, "accepted-full"), user.Id);
+        await service.ReverseAsync(rejected.Id, user.Id, "Qüsurlu qəbul qeydi səhv idi");
+        Assert.Equal("received", (await PoService(db).GetAsync(order.OrderId))!.Status);
+        Assert.Equal(100m, (await db.Stocks.SingleAsync()).Quantity);
+    }
+
+    [Fact]
+    public async Task ReversalStillRemovesStockWhenProductWasSoftDeleted()
+    {
+        await using var db = NewContext();
+        var (user, supplier, warehouse, product) = await SeedAsync(db, 0);
+        var order = await CreateApprovedOrder(db, user, supplier, warehouse, product, 4);
+        var service = GrnService(db);
+        var receipt = await service.CreateAsync(Request(order.OrderId, order.ItemId, 4, 0, 2, "deleted-product"), user.Id);
+        (await db.Products.SingleAsync()).MarkDeleted();
+        await db.SaveChangesAsync();
+        db.ChangeTracker.Clear();
+        await service.ReverseAsync(receipt.Id, user.Id, "Səhv qəbul");
+        Assert.Equal(0m, (await db.Stocks.SingleAsync()).Quantity);
+        Assert.Single((await service.GetAsync(receipt.Id))!.Items);
+    }
+
+    [Fact]
+    public async Task HiddenDeletedProductLineDoesNotMakeAnOrderLookFullyReceived()
+    {
+        await using var db = NewContext();
+        var (user, supplier, warehouse, product) = await SeedAsync(db, 0);
+        var otherProduct = new Product("İkinci məhsul", "GRN-SECOND", "", "", product.CategoryId, 1, "Piece", true);
+        db.Products.Add(otherProduct);
+        await db.SaveChangesAsync();
+        var service = PoService(db);
+        var order = await service.CreateAsync(new SavePurchaseOrderRequest(supplier.Id, warehouse.Id,
+            new DateOnly(2026, 1, 1), null, "AZN", null,
+            [new PurchaseOrderLineRequest(product.Id, 4, 2), new PurchaseOrderLineRequest(otherProduct.Id, 4, 2)]), user.Id);
+        await service.SubmitAsync(order.Id, user.Id);
+        await service.ApproveAsync(order.Id, user.Id, true);
+        otherProduct.MarkDeleted();
+        await db.SaveChangesAsync();
+        db.ChangeTracker.Clear();
+        await GrnService(db).CreateAsync(Request(order.Id, order.Items.Single(x => x.ProductId == product.Id).Id,
+            4, 0, 2, "visible-product-only"), user.Id);
+        Assert.Equal(PurchaseOrderStatus.PartiallyReceived, (await db.PurchaseOrders.SingleAsync()).Status);
+        Assert.Equal(2, (await service.GetAsync(order.Id))!.Items.Count);
+    }
+
+    [Fact]
+    public async Task ReversalThatLeavesToleranceOverReceiptDoesNotReopenCompletedOrder()
+    {
+        await using var db = NewContext();
+        var (user, supplier, warehouse, product) = await SeedAsync(db, 0);
+        var order = await CreateApprovedOrder(db, user, supplier, warehouse, product, 100);
+        var service = GrnService(db, 5);
+        var first = await service.CreateAsync(Request(order.OrderId, order.ItemId, 3, 0, 2, "tolerance-first"), user.Id);
+        await service.CreateAsync(Request(order.OrderId, order.ItemId, 102, 0, 2, "tolerance-last"), user.Id);
+        await service.ReverseAsync(first.Id, user.Id, "Kiçik qəbul geri qaytarılır");
+        Assert.Equal("received", (await PoService(db).GetAsync(order.OrderId))!.Status);
+        Assert.Equal(102m, (await db.Stocks.SingleAsync()).Quantity);
+        Assert.Equal(0m, Assert.Single((await PoService(db).GetAsync(order.OrderId))!.Items).RemainingQty);
     }
 
     private static CreateGoodsReceiptRequest Request(Guid orderId, Guid itemId, decimal received, decimal rejected,

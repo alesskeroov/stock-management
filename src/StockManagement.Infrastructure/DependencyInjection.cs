@@ -41,6 +41,7 @@ public static class DependencyInjection
         services.AddScoped(typeof(IGenericRepository<>), typeof(EfRepository<>));
         services.AddScoped<ICategoryRepository, EfCategoryRepository>();
         services.AddScoped<IProductRepository, EfProductRepository>();
+        services.AddScoped<StockManagement.Application.Products.IProductImportService, ProductImportService>();
         services.AddScoped<ISupplierRepository, EfSupplierRepository>();
         services.AddScoped<IStockMovementRepository, EfStockMovementRepository>();
         services.AddScoped<StockLogService>();

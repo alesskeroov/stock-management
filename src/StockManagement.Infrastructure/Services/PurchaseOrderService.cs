@@ -1,4 +1,5 @@
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Configuration;
 using System.Data;
 using StockManagement.Application.Abstractions;
 using StockManagement.Application.DTOs.PurchaseOrders;
@@ -10,7 +11,7 @@ using StockManagement.Infrastructure.Persistence;
 namespace StockManagement.Infrastructure.Services;
 
 public sealed class PurchaseOrderService(StockManagementDbContext db, DocumentNumberService numbers,
-    IAuditLogService audit)
+    IAuditLogService audit, IConfiguration? configuration = null)
 {
     public const int DefaultPageSize = 10;
     public const int MaximumPageSize = 10;
@@ -31,7 +32,7 @@ public sealed class PurchaseOrderService(StockManagementDbContext db, DocumentNu
         DateOnly? fromDate, DateOnly? toDate, CancellationToken cancellationToken = default)
     {
         size = size < 1 ? DefaultPageSize : Math.Min(size, MaximumPageSize);
-        var query = db.PurchaseOrders.AsNoTracking().Include(x => x.Supplier).Include(x => x.Warehouse)
+        var query = db.PurchaseOrders.IgnoreQueryFilters().Where(x => !x.IsDeleted).AsNoTracking().Include(x => x.Supplier).Include(x => x.Warehouse)
             .Include(x => x.Items).ThenInclude(x => x.Product)
             .Include(x => x.GoodsReceipts).ThenInclude(x => x.Items).AsQueryable();
         if (!string.IsNullOrWhiteSpace(status))
@@ -62,6 +63,9 @@ public sealed class PurchaseOrderService(StockManagementDbContext db, DocumentNu
     {
         var lines = ValidateLines(request.Items);
         await ValidateReferences(request.SupplierId, request.WarehouseId, lines.Select(x => x.ProductId), cancellationToken);
+        await using var transaction = db.Database.IsRelational()
+            ? await db.Database.BeginTransactionAsync(IsolationLevel.ReadCommitted, cancellationToken)
+            : null;
         var order = new PurchaseOrder(await numbers.GetNextAsync("PO", request.OrderDate.Year, cancellationToken),
             request.SupplierId, request.WarehouseId, request.OrderDate, request.ExpectedDate,
             request.Currency ?? "AZN", request.Note, userId);
@@ -70,6 +74,7 @@ public sealed class PurchaseOrderService(StockManagementDbContext db, DocumentNu
         await db.SaveChangesAsync(cancellationToken);
         var dto = ToDto(await Query().SingleAsync(x => x.Id == order.Id, cancellationToken));
         await audit.WriteAsync(userId, "create", "purchase_order", order.Id, newValues: dto, cancellationToken: cancellationToken);
+        if (transaction is not null) await transaction.CommitAsync(cancellationToken);
         return dto;
     }
 
@@ -88,6 +93,7 @@ public sealed class PurchaseOrderService(StockManagementDbContext db, DocumentNu
         order.UpdateDraft(request.SupplierId, request.WarehouseId, request.OrderDate, request.ExpectedDate,
             request.Currency ?? "AZN", request.Note);
         order.ReplaceItems(lines);
+        db.PurchaseOrderItems.AddRange(order.Items);
         await db.SaveChangesAsync(cancellationToken);
         var updated = ToDto(order);
         await audit.WriteAsync(userId, "update", "purchase_order", id, oldValues, updated, cancellationToken);
@@ -134,7 +140,8 @@ public sealed class PurchaseOrderService(StockManagementDbContext db, DocumentNu
             $"SELECT [id] FROM [dbo].[purchase_order_items] WITH (UPDLOCK, HOLDLOCK) WHERE [purchase_order_id] = {id}", cancellationToken);
     }
 
-    private IQueryable<PurchaseOrder> Query() => db.PurchaseOrders.Include(x => x.Supplier).Include(x => x.Warehouse)
+    private IQueryable<PurchaseOrder> Query() => db.PurchaseOrders.IgnoreQueryFilters().Where(x => !x.IsDeleted)
+        .Include(x => x.Supplier).Include(x => x.Warehouse)
         .Include(x => x.Items).ThenInclude(x => x.Product)
         .Include(x => x.GoodsReceipts).ThenInclude(x => x.Items);
 
@@ -154,10 +161,13 @@ public sealed class PurchaseOrderService(StockManagementDbContext db, DocumentNu
         IReadOnlyCollection<PurchaseOrderLineRequest>? items)
     {
         if (items is null || items.Count == 0) throw new ArgumentException("PO-da ən azı bir sətir olmalıdır.");
+        if (items.Any(x => x.OrderedQty <= 0 || x.OrderedQty > 999999999999999.999m || decimal.Round(x.OrderedQty, 3) != x.OrderedQty
+            || x.UnitPrice < 0 || x.UnitPrice > 9999999999999999.99m || decimal.Round(x.UnitPrice, 2) != x.UnitPrice))
+            throw new ArgumentException("Sifariş miqdarı müsbət və ən çox 3, qiymət mənfi olmayan və ən çox 2 onluq rəqəmli olmalıdır; bazanın rəqəm hədlərini keçməyin.");
         return items.Select(x => (x.ProductId, x.OrderedQty, x.UnitPrice)).ToArray();
     }
 
-    private static PurchaseOrderDto ToDto(PurchaseOrder order) => new(order.Id, order.PoNumber,
+    private PurchaseOrderDto ToDto(PurchaseOrder order) => new(order.Id, order.PoNumber,
         order.SupplierId, order.Supplier.Name, order.Supplier.Phone, order.Supplier.Email, order.Supplier.Address,
         order.Supplier.TaxId, order.WarehouseId, order.Warehouse.Name,
         PurchaseOrderStatusCodes.ToStorage(order.Status), order.OrderDate, order.ExpectedDate, order.Currency,
@@ -165,8 +175,9 @@ public sealed class PurchaseOrderService(StockManagementDbContext db, DocumentNu
         order.Note, order.CreatedBy, order.ApprovedBy, order.ApprovedAt, order.CancelledBy, order.CancelledAt,
         order.CancelReason, order.CreatedAt, order.UpdatedAt,
         order.Items.OrderBy(x => x.Product.Name).Select(x => new PurchaseOrderItemDto(x.Id, x.ProductId,
-            x.Product.Name, x.Product.Sku, x.OrderedQty, x.ReceivedQty, x.OrderedQty - x.ReceivedQty,
+            x.Product.Name, x.Product.Sku, x.OrderedQty, x.ReceivedQty, Math.Max(0m, x.OrderedQty - x.ReceivedQty),
             x.UnitPrice, decimal.Round(x.OrderedQty * x.UnitPrice, 2, MidpointRounding.AwayFromZero))).ToArray(),
         order.GoodsReceipts.OrderBy(x => x.ReceivedDate).Select(x => new GoodsReceiptSummaryDto(x.Id, x.GrnNumber,
-            x.ReceivedDate, x.Items.Sum(i => i.ReceivedQty), x.Items.Sum(i => i.RejectedQty))).ToArray());
+            x.ReceivedDate, x.Items.Sum(i => i.ReceivedQty), x.Items.Sum(i => i.RejectedQty), x.ReversedAt)).ToArray(),
+        configuration?.GetValue<decimal?>("Procurement:OverReceiptTolerancePercent") ?? 0m);
 }

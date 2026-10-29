@@ -17,7 +17,7 @@ public sealed record PurchaseOrderDto(Guid Id, string PoNumber, Guid SupplierId,
     string Currency, decimal TotalAmount, string? Note, Guid CreatedBy, Guid? ApprovedBy,
     DateTime? ApprovedAt, Guid? CancelledBy, DateTime? CancelledAt, string? CancelReason,
     DateTime CreatedAt, DateTime UpdatedAt, IReadOnlyCollection<PurchaseOrderItemDto> Items,
-    IReadOnlyCollection<GoodsReceiptSummaryDto> GoodsReceipts);
+    IReadOnlyCollection<GoodsReceiptSummaryDto> GoodsReceipts, decimal OverReceiptTolerancePercent = 0);
 
 public sealed record PurchaseOrderPage(IReadOnlyCollection<PurchaseOrderDto> Items, int CurrentPage,
     int PageSize, int TotalCount, int TotalPages, bool HasNext, bool HasPrevious);
@@ -27,4 +27,4 @@ public sealed record PurchaseOrderOptions(IReadOnlyCollection<PurchaseOrderOptio
     IReadOnlyCollection<PurchaseOrderOption> Warehouses, IReadOnlyCollection<PurchaseOrderOption> Products);
 public sealed record PurchaseOrderOption(Guid Id, string Name, string? Sku = null);
 public sealed record GoodsReceiptSummaryDto(Guid Id, string GrnNumber, DateOnly ReceivedDate,
-    decimal AcceptedQty, decimal RejectedQty);
+    decimal AcceptedQty, decimal RejectedQty, DateTime? ReversedAt = null);

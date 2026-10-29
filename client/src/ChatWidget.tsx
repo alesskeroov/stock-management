@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import type { FormEvent } from 'react'
 import './ChatWidget.css'
+import { submitOnEnter } from './formKeyboard'
 
 type Message = { role: 'user' | 'assistant'; text: string }
 const CHAT_API_URL = 'http://localhost:8000/api/chat'
@@ -60,8 +61,8 @@ export default function ChatWidget() {
         {error && <p className="chat-error">{error}</p>}
         <div ref={bottomRef} />
       </div>
-      <form className="chat-form" onSubmit={sendMessage}>
-        <input value={value} onChange={(event) => setValue(event.target.value)} placeholder="Mesajınızı yazın..." aria-label="Mesajınız" />
+      <form className="chat-form" onKeyDown={submitOnEnter} onSubmit={sendMessage}>
+        <input enterKeyHint="send" value={value} onChange={(event) => setValue(event.target.value)} placeholder="Mesajınızı yazın..." aria-label="Mesajınız" />
         <button type="submit" disabled={!value.trim() || typing} aria-label="Göndər">➤</button>
       </form>
       <div className="chat-caption">Enter ilə göndərin · AI cavabları səhv ola bilər</div>

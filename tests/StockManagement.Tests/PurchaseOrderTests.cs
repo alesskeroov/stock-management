@@ -32,9 +32,18 @@ public sealed class PurchaseOrderTests
         Assert.Equal(15m, order.TotalAmount);
         Assert.Equal(15m, Assert.Single(order.Items).LineTotal);
 
+        db.ChangeTracker.Clear();
+
         var edited = await service.UpdateAsync(order.Id,
             Request(supplier, warehouse, product, quantity: 4, price: 3, sentLineTotal: 999, sentTotal: 999), user.Id);
         Assert.Equal(12m, edited.TotalAmount);
+        db.ChangeTracker.Clear();
+        var saved = await service.GetAsync(order.Id);
+        Assert.NotNull(saved);
+        Assert.Equal(12m, saved.TotalAmount);
+        Assert.Equal(4m, Assert.Single(saved.Items).OrderedQty);
+        Assert.Equal(3m, Assert.Single(saved.Items).UnitPrice);
+        Assert.Single(await db.PurchaseOrderItems.Where(x => x.PurchaseOrderId == order.Id).ToArrayAsync());
         Assert.Equal(17m, await db.Stocks.Select(x => x.Quantity).SingleAsync());
         Assert.Empty(await db.StockMovements.ToArrayAsync());
     }

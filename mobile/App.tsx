@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   ActivityIndicator, Alert, FlatList, KeyboardAvoidingView, Modal, Platform, Pressable,
   SafeAreaView, ScrollView, StatusBar, StyleSheet, Text, TextInput, View,
@@ -182,13 +182,15 @@ function Splash() { return <View style={[styles.safe, styles.center]}><ActivityI
 
 function LoginScreen({ busy, error, onLogin }: { busy: boolean; error: string; onLogin: (identifier: string, password: string) => void }) {
   const [identifier, setIdentifier] = useState(''); const [password, setPassword] = useState('')
+  const passwordRef = useRef<TextInput>(null)
+  const submit = () => { if (!busy && identifier.trim() && password) onLogin(identifier.trim(), password) }
   return <SafeAreaView style={styles.loginSafe}><StatusBar barStyle="light-content" backgroundColor={C.forest} /><KeyboardAvoidingView style={styles.loginWrap} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
     <View style={styles.loginLogo}><Text style={styles.brandGlyph}>▦</Text></View><Text style={styles.loginBrand}>Stockroom</Text><Text style={styles.loginKicker}>STOK İDARƏETMƏSİ</Text>
     <View style={styles.loginCard}><Text style={styles.loginTitle}>Xoş gəlmisiniz</Text><Text style={styles.loginHint}>Davam etmək üçün hesabınıza daxil olun.</Text>
-      <Text style={styles.label}>İstifadəçi adı və ya email</Text><TextInput style={styles.input} value={identifier} onChangeText={setIdentifier} autoCapitalize="none" autoCorrect={false} placeholder="admin@company.az" placeholderTextColor="#a5afa9" />
-      <Text style={styles.label}>Şifrə</Text><TextInput style={styles.input} value={password} onChangeText={setPassword} secureTextEntry placeholder="Şifrənizi daxil edin" placeholderTextColor="#a5afa9" onSubmitEditing={() => onLogin(identifier, password)} />
+      <Text style={styles.label}>İstifadəçi adı və ya email</Text><TextInput style={styles.input} value={identifier} onChangeText={setIdentifier} autoCapitalize="none" autoCorrect={false} editable={!busy} returnKeyType="next" submitBehavior="submit" onSubmitEditing={() => passwordRef.current?.focus()} placeholder="admin@company.az" placeholderTextColor="#a5afa9" />
+      <Text style={styles.label}>Şifrə</Text><TextInput ref={passwordRef} style={styles.input} value={password} onChangeText={setPassword} secureTextEntry editable={!busy} returnKeyType="go" placeholder="Şifrənizi daxil edin" placeholderTextColor="#a5afa9" onSubmitEditing={submit} />
       {!!error && <Text style={styles.loginError}>{error}</Text>}
-      <Pressable style={[styles.loginButton, (!identifier || !password || busy) && styles.disabled]} disabled={!identifier || !password || busy} onPress={() => onLogin(identifier, password)}>{busy ? <ActivityIndicator color="white" /> : <Text style={styles.loginButtonText}>Daxil ol  →</Text>}</Pressable>
+      <Pressable style={[styles.loginButton, (!identifier.trim() || !password || busy) && styles.disabled]} disabled={!identifier.trim() || !password || busy} onPress={submit}>{busy ? <ActivityIndicator color="white" /> : <Text style={styles.loginButtonText}>Daxil ol  →</Text>}</Pressable>
     </View><Text style={styles.loginFooter}>Stockroom  •  Təhlükəsiz inventar idarəetməsi</Text>
   </KeyboardAvoidingView></SafeAreaView>
 }
@@ -215,20 +217,27 @@ function Pagination({ page, onChange }: { page: ProductPage; onChange: (page: nu
 
 function ProductFormModal({ visible, item, categories, busy, onClose, onSave }: { visible: boolean; item: Product | null; categories: Category[]; busy: boolean; onClose: () => void; onSave: (values: Omit<Product, 'id' | 'quantity'>) => void }) {
   const [name, setName] = useState(''); const [sku, setSku] = useState(''); const [barcode, setBarcode] = useState(''); const [description, setDescription] = useState(''); const [categoryId, setCategoryId] = useState(''); const [price, setPrice] = useState(''); const [unit, setUnit] = useState('Piece'); const [active, setActive] = useState(true)
+  const fieldRefs = useRef<Record<string, TextInput | null>>({})
+  const submit = () => {
+    if (busy || !name.trim() || !sku.trim() || !categoryId) return
+    const unitPrice = Number(price || 0)
+    if (!Number.isFinite(unitPrice) || unitPrice < 0) { Alert.alert('Qiymət düzgün deyil', 'Mənfi olmayan qiymət daxil edin.'); return }
+    onSave({ name: name.trim(), sku: sku.trim(), barcode, description, categoryId, unitPrice, unitOfMeasure: unit, isActive: active })
+  }
   useEffect(() => {
     setName(item?.name ?? ''); setSku(item?.sku ?? ''); setBarcode(item?.barcode ?? ''); setDescription(item?.description ?? '');
     setCategoryId(item?.categoryId ?? categories[0]?.id ?? ''); setPrice(item ? String(item.unitPrice) : ''); setUnit(item?.unitOfMeasure ?? 'Piece'); setActive(item?.isActive ?? true)
   }, [item, visible, categories])
-  const input = (label: string, value: string, change: (value: string) => void, placeholder: string, options: { keyboard?: 'default' | 'numeric'; multiline?: boolean } = {}) => <View style={styles.formField}><Text style={styles.label}>{label}</Text><TextInput style={[styles.input, options.multiline && styles.multiline]} value={value} onChangeText={change} placeholder={placeholder} placeholderTextColor="#a5afa9" keyboardType={options.keyboard ?? 'default'} multiline={options.multiline} /></View>
+  const input = (label: string, value: string, change: (value: string) => void, placeholder: string, options: { keyboard?: 'default' | 'numeric'; multiline?: boolean; next?: string } = {}) => <View style={styles.formField}><Text style={styles.label}>{label}</Text><TextInput ref={(element) => { fieldRefs.current[label] = element }} style={[styles.input, options.multiline && styles.multiline]} value={value} onChangeText={change} editable={!busy} placeholder={placeholder} placeholderTextColor="#a5afa9" keyboardType={options.keyboard ?? 'default'} multiline={options.multiline} returnKeyType={options.multiline ? 'default' : options.next ? 'next' : 'done'} submitBehavior={options.multiline ? 'newline' : options.next ? 'submit' : 'blurAndSubmit'} onSubmitEditing={options.multiline ? undefined : options.next ? () => fieldRefs.current[options.next!]?.focus() : submit} /></View>
   return <Modal visible={visible} animationType="slide" onRequestClose={onClose}><SafeAreaView style={styles.modalSafe}><View style={styles.modalHead}><View><Text style={styles.eyebrow}>{item ? 'MƏHSULU DÜZƏLT' : 'YENİ MƏHSUL'}</Text><Text style={styles.modalTitle}>{item ? 'Məhsul məlumatları' : 'Kataloqa əlavə et'}</Text></View><Pressable style={styles.closeButton} onPress={onClose}><Text style={styles.closeText}>×</Text></Pressable></View>
     <ScrollView keyboardShouldPersistTaps="handled" contentContainerStyle={styles.formBody}>
-      {input('Məhsulun adı *', name, setName, 'Məs. Simsiz klaviatura')}{input('SKU *', sku, setSku, 'KB-001')}{input('Barkod', barcode, setBarcode, 'Barkod nömrəsi')}
+      {input('Məhsulun adı *', name, setName, 'Məs. Simsiz klaviatura', { next: 'SKU *' })}{input('SKU *', sku, setSku, 'KB-001', { next: 'Barkod' })}{input('Barkod', barcode, setBarcode, 'Barkod nömrəsi', { next: 'Satış qiyməti (AZN) *' })}
       <View style={styles.formField}><Text style={styles.label}>Kateqoriya *</Text><ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.choices}>{categories.map(category => <Pressable key={category.id} onPress={() => setCategoryId(category.id)} style={[styles.choice, categoryId === category.id && styles.choiceActive]}><Text style={[styles.choiceText, categoryId === category.id && styles.choiceTextActive]}>{category.name}</Text></Pressable>)}</ScrollView></View>
       {input('Satış qiyməti (AZN) *', price, setPrice, '0.00', { keyboard: 'numeric' })}
       <View style={styles.formField}><Text style={styles.label}>Ölçü vahidi</Text><View style={styles.choices}>{['Piece', 'Kg', 'Liter', 'Package', 'Box'].map(value => <Pressable key={value} onPress={() => setUnit(value)} style={[styles.choice, unit === value && styles.choiceActive]}><Text style={[styles.choiceText, unit === value && styles.choiceTextActive]}>{({ Piece: 'Ədəd', Kg: 'Kq', Liter: 'Litr', Package: 'Paket', Box: 'Qutu' } as Record<string, string>)[value]}</Text></Pressable>)}</View></View>
       {input('Təsvir', description, setDescription, 'Məhsul haqqında qısa məlumat', { multiline: true })}
       <Pressable style={styles.activeToggle} onPress={() => setActive(value => !value)}><View><Text style={styles.activeTitle}>Satışda aktivdir</Text><Text style={styles.cardMeta}>Passiv məhsul kataloqda saxlanılır.</Text></View><View style={[styles.switch, active && styles.switchOn]}><View style={[styles.switchKnob, active && styles.switchKnobOn]} /></View></Pressable>
-    </ScrollView><View style={styles.formFooter}><Pressable style={styles.cancelButton} onPress={onClose}><Text style={styles.cancelText}>Ləğv et</Text></Pressable><Pressable disabled={busy || !name.trim() || !sku.trim() || !categoryId} style={[styles.saveButton, (busy || !name.trim() || !sku.trim() || !categoryId) && styles.disabled]} onPress={() => onSave({ name: name.trim(), sku: sku.trim(), barcode, description, categoryId, unitPrice: Number(price || 0), unitOfMeasure: unit, isActive: active })}>{busy ? <ActivityIndicator color="white" /> : <Text style={styles.saveText}>Yadda saxla</Text>}</Pressable></View>
+    </ScrollView><View style={styles.formFooter}><Pressable style={styles.cancelButton} onPress={onClose}><Text style={styles.cancelText}>Ləğv et</Text></Pressable><Pressable disabled={busy || !name.trim() || !sku.trim() || !categoryId} style={[styles.saveButton, (busy || !name.trim() || !sku.trim() || !categoryId) && styles.disabled]} onPress={submit}>{busy ? <ActivityIndicator color="white" /> : <Text style={styles.saveText}>Yadda saxla</Text>}</Pressable></View>
   </SafeAreaView></Modal>
 }
 

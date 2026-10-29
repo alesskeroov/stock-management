@@ -25,10 +25,10 @@ public sealed class EfProductRepository(StockManagementDbContext dbContext, Stoc
     }
 
     public Task<Product?> GetBySkuAsync(string sku, CancellationToken cancellationToken = default) =>
-        DbContext.Products.SingleOrDefaultAsync(x => x.Sku == sku.Trim(), cancellationToken);
+        DbContext.Products.AsNoTracking().SingleOrDefaultAsync(x => x.Sku == sku.Trim(), cancellationToken);
 
     public Task<Product?> GetByBarcodeAsync(string barcode, CancellationToken cancellationToken = default) =>
-        DbContext.Products.SingleOrDefaultAsync(x => x.Barcode == barcode.Trim() && x.Barcode != string.Empty, cancellationToken);
+        DbContext.Products.AsNoTracking().SingleOrDefaultAsync(x => x.Barcode == barcode.Trim() && x.Barcode != string.Empty, cancellationToken);
 
     public async Task<IReadOnlyDictionary<Guid, decimal>> GetStockQuantitiesAsync(IReadOnlyCollection<Guid>? productIds = null,
         CancellationToken cancellationToken = default)

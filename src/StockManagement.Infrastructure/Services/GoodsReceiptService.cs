@@ -34,6 +34,9 @@ public sealed class GoodsReceiptService(StockManagementDbContext db, StockServic
     public async Task<GoodsReceiptDto> CreateAsync(CreateGoodsReceiptRequest request, Guid receivedBy,
         string? headerIdempotencyKey = null, CancellationToken cancellationToken = default)
     {
+        if (!string.IsNullOrWhiteSpace(headerIdempotencyKey) && !string.IsNullOrWhiteSpace(request.IdempotencyKey)
+            && !string.Equals(headerIdempotencyKey.Trim(), request.IdempotencyKey.Trim(), StringComparison.Ordinal))
+            throw new GoodsReceiptValidationException("Header və sorğudakı idempotency açarları eyni olmalıdır.");
         var rawKey = string.IsNullOrWhiteSpace(headerIdempotencyKey) ? request.IdempotencyKey : headerIdempotencyKey;
         var key = string.IsNullOrWhiteSpace(rawKey) ? null : rawKey.Trim();
         if (key?.Length > 128) throw new GoodsReceiptValidationException("Idempotency key ən çox 128 simvol ola bilər.");
@@ -69,16 +72,18 @@ public sealed class GoodsReceiptService(StockManagementDbContext db, StockServic
                 var prior = await FindByIdempotencyKeyAsync(key, cancellationToken);
                 if (prior is not null)
                 {
+                    EnsureSameRequest(prior, request);
                     if (transaction is not null) await transaction.RollbackAsync(cancellationToken);
                     return await ToDtoAsync(prior, cancellationToken);
                 }
             }
 
-            var order = await db.PurchaseOrders.Include(x => x.Warehouse).Include(x => x.Items).ThenInclude(x => x.Product)
+            var order = await db.PurchaseOrders.IgnoreQueryFilters().Where(x => !x.IsDeleted)
+                .Include(x => x.Warehouse).Include(x => x.Items).ThenInclude(x => x.Product)
                 .SingleOrDefaultAsync(x => x.Id == request.PurchaseOrderId, cancellationToken)
                 ?? throw new KeyNotFoundException("Satınalma sifarişi tapılmadı.");
             if (order.Status is not (PurchaseOrderStatus.Approved or PurchaseOrderStatus.PartiallyReceived))
-                throw new GoodsReceiptConflictException($"{order.PoNumber} üçün GRN yalnız approved və ya partially_received statusunda yaradıla bilər.");
+                throw new GoodsReceiptConflictException($"{order.PoNumber} üçün mal qəbulu yalnız təsdiqlənmiş və ya hissəli qəbul edilmiş sifarişdə yaradıla bilər.");
 
             var lines = request.Items!;
             if (lines.Select(x => x.PurchaseOrderItemId).Distinct().Count() != lines.Count)
@@ -101,6 +106,8 @@ public sealed class GoodsReceiptService(StockManagementDbContext db, StockServic
             foreach (var productId in productIds) await LockProductAndStockAsync(productId, order.WarehouseId, cancellationToken);
 
             var products = await db.Products.Where(x => productIds.Contains(x.Id)).ToDictionaryAsync(x => x.Id, cancellationToken);
+            if (products.Count != productIds.Length)
+                throw new GoodsReceiptValidationException("PO-dakı məhsullardan biri silinib. Məhsul məlumatlarını yoxlayın.");
             foreach (var productId in productIds)
                 await db.Entry(products[productId]).ReloadAsync(cancellationToken);
             var stocks = await db.Stocks.Where(x => productIds.Contains(x.ProductId) && x.WarehouseId == order.WarehouseId)
@@ -130,11 +137,10 @@ public sealed class GoodsReceiptService(StockManagementDbContext db, StockServic
                 if (line.ReceivedQty <= 0) continue;
                 poItem.RecordReceived(line.ReceivedQty);
                 var product = products[poItem.ProductId];
-                var currentStock = await stockService.GetStock(product.Id, order.WarehouseId, cancellationToken);
                 var quantityBefore = totalStocks.GetValueOrDefault(product.Id);
-                var newAverageCost = currentStock <= 0
+                var newAverageCost = quantityBefore <= 0
                     ? line.UnitCost
-                    : ((currentStock * product.AverageCost) + (line.ReceivedQty * line.UnitCost)) / (currentStock + line.ReceivedQty);
+                    : ((quantityBefore * product.AverageCost) + (line.ReceivedQty * line.UnitCost)) / (quantityBefore + line.ReceivedQty);
                 product.SetAverageCost(newAverageCost);
                 if (stocks.TryGetValue(product.Id, out var stock)) stock.Increase(line.ReceivedQty);
                 else
@@ -176,7 +182,11 @@ public sealed class GoodsReceiptService(StockManagementDbContext db, StockServic
             {
                 db.ChangeTracker.Clear();
                 var existing = await FindByIdempotencyKeyAsync(key, cancellationToken);
-                if (existing is not null) return await ToDtoAsync(existing, cancellationToken);
+                if (existing is not null)
+                {
+                    EnsureSameRequest(existing, request);
+                    return await ToDtoAsync(existing, cancellationToken);
+                }
                 throw;
             }
         }
@@ -212,16 +222,20 @@ public sealed class GoodsReceiptService(StockManagementDbContext db, StockServic
             ?? throw new KeyNotFoundException("GRN tapılmadı.");
         if (receipt.ReversedAt.HasValue) throw new GoodsReceiptConflictException("Bu GRN artıq geri qaytarılıb.");
         var order = receipt.PurchaseOrder;
-        var movements = await db.StockMovements.Include(x => x.Product).Where(x => x.ReferenceType == "GRN" && x.ReferenceId == id &&
+        var movements = await db.StockMovements.IgnoreQueryFilters().Include(x => x.Product).Where(x => x.ReferenceType == "GRN" && x.ReferenceId == id &&
             x.Type == StockMovementType.PurchaseIn).OrderBy(x => x.ProductId).ToListAsync(cancellationToken);
         var movementProductIds = movements.Select(movement => movement.ProductId).Distinct().ToArray();
+        foreach (var productId in movementProductIds)
+            await LockProductAndStockAsync(productId, receipt.WarehouseId, cancellationToken);
+        if (db.Database.IsSqlServer())
+            foreach (var product in movements.Select(x => x.Product).Distinct())
+                await db.Entry(product).ReloadAsync(cancellationToken);
         var totalStocks = await db.Stocks.Where(x => movementProductIds.Contains(x.ProductId))
             .GroupBy(x => x.ProductId).Select(group => new { ProductId = group.Key, Quantity = group.Sum(x => x.Quantity) })
             .ToDictionaryAsync(x => x.ProductId, x => x.Quantity, cancellationToken);
         var oldStatus = PurchaseOrderStatusCodes.ToStorage(order.Status);
         foreach (var movement in movements)
         {
-            await LockProductAndStockAsync(movement.ProductId, receipt.WarehouseId, cancellationToken);
             var current = await stockService.GetStock(movement.ProductId, receipt.WarehouseId, cancellationToken);
             var cache = await db.Stocks.SingleOrDefaultAsync(x => x.ProductId == movement.ProductId && x.WarehouseId == receipt.WarehouseId, cancellationToken);
             if (current != (cache?.Quantity ?? 0m))
@@ -229,6 +243,11 @@ public sealed class GoodsReceiptService(StockManagementDbContext db, StockServic
             if (current < movement.Quantity)
                 throw new GoodsReceiptConflictException($"{movement.Product.Name} üzrə GRN-i geri qaytarmaq mümkün deyil: {movement.Quantity:0.###} ədəd geri alınmalıdır, mövcud stok isə {current:0.###}-dır. Məhsulun bir hissəsi artıq istifadə olunub.");
             var quantityBefore = totalStocks.GetValueOrDefault(movement.ProductId);
+            var remainingQuantity = quantityBefore - movement.Quantity;
+            var remainingValue = quantityBefore * movement.Product.AverageCost - movement.Quantity * movement.UnitCost;
+            if (remainingQuantity > 0 && remainingValue < 0)
+                throw new GoodsReceiptConflictException($"{movement.Product.Name} üzrə maya dəyəri sonrakı əməliyyatlarla dəyişib. Geri qaytarmadan əvvəl stok dəyərini uzlaşdırın.");
+            movement.Product.SetAverageCost(remainingQuantity <= 0 ? 0 : remainingValue / remainingQuantity);
             if (cache is not null) cache.SetQuantity(cache.Quantity - movement.Quantity);
             stockLogs.Record(movement.ProductId, movement.Product.Name, StockLogType.OUT, quantityBefore,
                 quantityBefore - movement.Quantity, $"Mal qəbulu geri qaytarıldı: {receipt.GrnNumber}", userId);
@@ -239,7 +258,8 @@ public sealed class GoodsReceiptService(StockManagementDbContext db, StockServic
             var poItem = order.Items.Single(x => x.Id == item.PurchaseOrderItemId);
             poItem.ReverseReceived(item.ReceivedQty);
         }
-        if (order.Status is PurchaseOrderStatus.Received or PurchaseOrderStatus.PartiallyReceived)
+        if (movements.Count > 0 && order.Status is (PurchaseOrderStatus.Received or PurchaseOrderStatus.PartiallyReceived)
+            && order.Items.Any(x => x.ReceivedQty < x.OrderedQty))
             order.ReopenAfterReceiptReversal();
         receipt.MarkReversed(userId, reason);
         await audit.WriteAsync(userId, "goods-receipt-reversed", "goods_receipt", id,
@@ -272,7 +292,8 @@ public sealed class GoodsReceiptService(StockManagementDbContext db, StockServic
             page, size, count, totalPages, page < totalPages, page > 1);
     }
 
-    private IQueryable<GoodsReceipt> ReceiptQuery() => db.GoodsReceipts.Include(x => x.PurchaseOrder)
+    private IQueryable<GoodsReceipt> ReceiptQuery() => db.GoodsReceipts.IgnoreQueryFilters().Where(x => !x.PurchaseOrder.IsDeleted)
+        .Include(x => x.PurchaseOrder)
         .Include(x => x.Warehouse).Include(x => x.Items).ThenInclude(x => x.Product);
 
     private Task<GoodsReceipt?> FindByIdempotencyKeyAsync(string key, CancellationToken cancellationToken) =>
@@ -300,8 +321,27 @@ public sealed class GoodsReceiptService(StockManagementDbContext db, StockServic
     {
         if (request.PurchaseOrderId == Guid.Empty) throw new GoodsReceiptValidationException("PO seçilməlidir.");
         if (request.Items is null || request.Items.Count == 0) throw new GoodsReceiptValidationException("GRN ən azı bir sətir daşımalıdır.");
-        if (request.Items.Any(x => x.ReceivedQty < 0 || x.RejectedQty < 0 || x.UnitCost < 0 || x.ReceivedQty + x.RejectedQty <= 0))
+        if (request.Items.Any(x => x.ReceivedQty < 0 || x.RejectedQty < 0 || x.UnitCost < 0 || (x.ReceivedQty == 0 && x.RejectedQty == 0)))
             throw new GoodsReceiptValidationException("Qəbul və qüsurlu miqdar mənfi ola bilməz, vahid maya dəyəri də mənfi ola bilməz; sətirdə ən azı bir miqdar müsbət olmalıdır.");
+        if (request.Items.Any(x => decimal.Round(x.ReceivedQty, 3) != x.ReceivedQty || decimal.Round(x.RejectedQty, 3) != x.RejectedQty
+            || x.ReceivedQty > 999999999999999.999m || x.RejectedQty > 999999999999999.999m))
+            throw new GoodsReceiptValidationException("Miqdar ən çox 3 onluq rəqəmli olmalı və bazanın miqdar həddini keçməməlidir.");
+        if (request.Items.Any(x => decimal.Round(x.UnitCost, 2) != x.UnitCost || x.UnitCost > 9999999999999999.99m))
+            throw new GoodsReceiptValidationException("Vahid maya dəyəri ən çox 2 onluq rəqəmli olmalı və bazanın qiymət həddini keçməməlidir.");
+        if (request.Note?.Trim().Length > 2000 || request.Items.Any(x => x.BatchNo?.Trim().Length > 64))
+            throw new GoodsReceiptValidationException("Qeyd ən çox 2000, partiya nömrəsi ən çox 64 simvol ola bilər.");
+        if (request.ReceivedDate.Year < 2000)
+            throw new GoodsReceiptValidationException("Qəbul tarixi 2000-ci ildən əvvəl ola bilməz.");
+    }
+
+    private static void EnsureSameRequest(GoodsReceipt receipt, CreateGoodsReceiptRequest request)
+    {
+        if (receipt.PurchaseOrderId != request.PurchaseOrderId || receipt.ReceivedDate != request.ReceivedDate
+            || (receipt.Note?.Trim() ?? "") != (request.Note?.Trim() ?? "") || receipt.Items.Count != request.Items!.Count
+            || receipt.Items.Any(saved => !request.Items.Any(line => line.PurchaseOrderItemId == saved.PurchaseOrderItemId
+                && line.ReceivedQty == saved.ReceivedQty && line.RejectedQty == saved.RejectedQty && line.UnitCost == saved.UnitCost
+                && line.ExpiryDate == saved.ExpiryDate && (line.BatchNo?.Trim() ?? "") == (saved.BatchNo ?? ""))))
+            throw new GoodsReceiptConflictException("Bu idempotency açarı başqa qəbul məlumatları üçün istifadə edilib. Əvvəlki GRN-i yoxlayın; yeni qəbul üçün yeni əməliyyat başladın.");
     }
 
     private static bool IsUniqueViolation(DbUpdateException exception) =>
